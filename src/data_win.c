@@ -32,6 +32,13 @@ static uint32_t* readPointerTable(BinaryReader* reader, uint32_t* outCount) {
     return ptrs;
 }
 
+static int32_t resolveReference(DataWin* dw, uint32_t val, int32_t (*resolveFunc)(DataWin*, uint32_t)) {
+    if (val == 0) return -1;
+    if (val == 0xFFFFFFFF) return -1;
+    if (dw->gen8.bytecodeVersion < 15 && val < 100000) return (int32_t)val; // BC14 Index heuristic
+    return resolveFunc(dw, val);
+}
+
 // Reads a PointerList of EventAction entries. Used by TMLN and OBJT.
 static EventAction* readEventActions(BinaryReader* reader, DataWin* dw, uint32_t* outCount) {
     uint32_t count;
@@ -50,7 +57,11 @@ static EventAction* readEventActions(BinaryReader* reader, DataWin* dw, uint32_t
         actions[i].useApplyTo = BinaryReader_readBool32(reader);
         actions[i].exeType = BinaryReader_readUint32(reader);
         actions[i].actionName = readStringPtr(reader, dw);
-        actions[i].codeId = BinaryReader_readInt32(reader);
+        if (dw->gen8.bytecodeVersion < 15) {
+            actions[i].codeId = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveCODE);
+        } else {
+            actions[i].codeId = BinaryReader_readInt32(reader);
+        }
         actions[i].argumentCount = BinaryReader_readUint32(reader);
         actions[i].who = BinaryReader_readInt32(reader);
         actions[i].relative = BinaryReader_readBool32(reader);
@@ -273,28 +284,62 @@ static void parseGEN8(BinaryReader* reader, DataWin* dw) {
 
 static void parseOPTN(BinaryReader* reader, DataWin* dw) {
     Optn* o = &dw->optn;
+    o->info = 0;
 
     int32_t marker = BinaryReader_readInt32(reader);
-    if (marker != (int32_t)0x80000000) {
-        fprintf(stderr, "OPTN: expected new format marker 0x80000000, got 0x%08X\n", (uint32_t)marker);
-        exit(1);
+    if (marker == (int32_t)0x80000000) {
+        int32_t shaderExtVersion = BinaryReader_readInt32(reader);
+        (void)shaderExtVersion; // always 2
+        o->info = BinaryReader_readUint64(reader);
+        o->scale = BinaryReader_readInt32(reader);
+        o->windowColor = BinaryReader_readUint32(reader);
+        o->colorDepth = BinaryReader_readUint32(reader);
+        o->resolution = BinaryReader_readUint32(reader);
+        o->frequency = BinaryReader_readUint32(reader);
+        o->vertexSync = BinaryReader_readUint32(reader);
+        o->priority = BinaryReader_readUint32(reader);
+        o->backImage = BinaryReader_readUint32(reader);
+        o->frontImage = BinaryReader_readUint32(reader);
+        o->loadImage = BinaryReader_readUint32(reader);
+        o->loadAlpha = BinaryReader_readUint32(reader);
+    } else if (marker == (int32_t)0x00000001) {
+        // Legacy format: options are stored as individual 32-bit booleans/ints
+        if (marker) o->info |= (1ULL << 0); // FullScreen
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 1); // InterpolatePixels
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 2); // UseNewAudio
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 3); // NoBorder
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 4); // ShowCursor
+        o->scale = BinaryReader_readInt32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 5); // Sizeable
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 6); // StayOnTop
+        o->windowColor = BinaryReader_readUint32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 7); // ChangeResolution
+        o->colorDepth = BinaryReader_readUint32(reader);
+        o->resolution = BinaryReader_readUint32(reader);
+        o->frequency = BinaryReader_readUint32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 8); // NoButtons
+        o->vertexSync = BinaryReader_readUint32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 9); // ScreenKey
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 10); // HelpKey
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 11); // QuitKey
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 12); // SaveKey
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 13); // ScreenShotKey
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 14); // CloseSec
+        o->priority = BinaryReader_readUint32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 15); // Freeze
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 16); // ShowProgress
+        o->backImage = BinaryReader_readUint32(reader);
+        o->frontImage = BinaryReader_readUint32(reader);
+        o->loadImage = BinaryReader_readUint32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 17); // LoadTransparent
+        o->loadAlpha = BinaryReader_readUint32(reader);
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 18); // ScaleProgress
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 19); // DisplayErrors
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 20); // WriteErrors
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 21); // AbortErrors
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 22); // VariableErrors
+        if (BinaryReader_readUint32(reader)) o->info |= (1ULL << 23); // CreationEventOrder
     }
-
-    int32_t shaderExtVersion = BinaryReader_readInt32(reader);
-    (void)shaderExtVersion; // always 2
-
-    o->info = BinaryReader_readUint64(reader);
-    o->scale = BinaryReader_readInt32(reader);
-    o->windowColor = BinaryReader_readUint32(reader);
-    o->colorDepth = BinaryReader_readUint32(reader);
-    o->resolution = BinaryReader_readUint32(reader);
-    o->frequency = BinaryReader_readUint32(reader);
-    o->vertexSync = BinaryReader_readUint32(reader);
-    o->priority = BinaryReader_readUint32(reader);
-    o->backImage = BinaryReader_readUint32(reader);
-    o->frontImage = BinaryReader_readUint32(reader);
-    o->loadImage = BinaryReader_readUint32(reader);
-    o->loadAlpha = BinaryReader_readUint32(reader);
 
     // Constants SimpleList
     o->constantCount = BinaryReader_readUint32(reader);
@@ -445,7 +490,7 @@ static void parseSOND(BinaryReader* reader, DataWin* dw) {
 
         // AudioGroup or preload field at offset +28
         // For GMS 1.4.x (bytecodeVersion >= 14) with Regular flag: resource_id
-        if ((snd->flags & 0x64) == 0x64) {
+        if (dw->gen8.bytecodeVersion >= 14 && (snd->flags & 0x64) == 0x64) {
             snd->audioGroup = BinaryReader_readInt32(reader);
         } else {
             int32_t preload = BinaryReader_readInt32(reader);
@@ -600,6 +645,7 @@ static void parseBGND(BinaryReader* reader, DataWin* dw) {
     b->backgrounds = safeCalloc(count, sizeof(Background));
     repeat(count, i) {
         BinaryReader_seek(reader, ptrs[i]);
+        hmput(dw->bgndOffsetMap, ptrs[i], (int32_t)i);
         Background* bg = &b->backgrounds[i];
         bg->name = readStringPtr(reader, dw);
         bg->transparent = BinaryReader_readBool32(reader);
@@ -685,7 +731,11 @@ static void parseSCPT(BinaryReader* reader, DataWin* dw) {
     repeat(count, i) {
         BinaryReader_seek(reader, ptrs[i]);
         s->scripts[i].name = readStringPtr(reader, dw);
-        s->scripts[i].codeId = BinaryReader_readInt32(reader);
+        if (dw->gen8.bytecodeVersion < 15) {
+            s->scripts[i].codeId = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveCODE);
+        } else {
+            s->scripts[i].codeId = BinaryReader_readInt32(reader);
+        }
     }
     free(ptrs);
 }
@@ -697,7 +747,11 @@ static void parseGLOB(BinaryReader* reader, DataWin* dw) {
     if (g->count > 0) {
         g->codeIds = safeMalloc(g->count * sizeof(int32_t));
         repeat(g->count, i) {
+            if (dw->gen8.bytecodeVersion < 15) {
+            g->codeIds[i] = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveCODE);
+        } else {
             g->codeIds[i] = BinaryReader_readInt32(reader);
+        }
         }
     } else {
         g->codeIds = nullptr;
@@ -968,9 +1022,14 @@ static void parseOBJT(BinaryReader* reader, DataWin* dw) {
     o->objects = safeMalloc(count * sizeof(GameObject));
     repeat(count, i) {
         BinaryReader_seek(reader, ptrs[i]);
+        hmput(dw->objtOffsetMap, ptrs[i], (int32_t)i);
         GameObject* obj = &o->objects[i];
         obj->name = readStringPtr(reader, dw);
-        obj->spriteId = BinaryReader_readInt32(reader);
+        if (dw->gen8.bytecodeVersion < 15) {
+            obj->spriteId = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveSPRT);
+        } else {
+            obj->spriteId = BinaryReader_readInt32(reader);
+        }
         obj->visible = BinaryReader_readBool32(reader);
         if (DataWin_isVersionAtLeast(dw, 2022, 5, 0, 0)) {
             obj->managed = BinaryReader_readBool32(reader);
@@ -980,8 +1039,13 @@ static void parseOBJT(BinaryReader* reader, DataWin* dw) {
         obj->solid = BinaryReader_readBool32(reader);
         obj->depth = BinaryReader_readInt32(reader);
         obj->persistent = BinaryReader_readBool32(reader);
-        obj->parentId = BinaryReader_readInt32(reader);
-        obj->textureMaskId = BinaryReader_readInt32(reader);
+        if (dw->gen8.bytecodeVersion < 15) {
+            obj->parentId = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveOBJT);
+            obj->textureMaskId = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveSPRT);
+        } else {
+            obj->parentId = BinaryReader_readInt32(reader);
+            obj->textureMaskId = BinaryReader_readInt32(reader);
+        }
         obj->usesPhysics = BinaryReader_readBool32(reader);
         obj->isSensor = BinaryReader_readBool32(reader);
         obj->collisionShape = BinaryReader_readUint32(reader);
@@ -1051,7 +1115,7 @@ static void parseOBJT(BinaryReader* reader, DataWin* dw) {
 // They allocate and populate the corresponding fields on Room.
 // They are used by both the eager parse path and the lazy load path (DataWin_loadRoomPayload).
 
-static void readRoomBackgrounds(BinaryReader* reader, Room* room) {
+static void readRoomBackgrounds(BinaryReader* reader, DataWin* dw, Room* room) {
     uint32_t bgCount;
     uint32_t* bgPtrs = readPointerTable(reader, &bgCount);
     room->backgrounds = safeMalloc(8 * sizeof(RoomBackground));
@@ -1061,7 +1125,11 @@ static void readRoomBackgrounds(BinaryReader* reader, Room* room) {
         RoomBackground* bg = &room->backgrounds[j];
         bg->enabled = BinaryReader_readBool32(reader);
         bg->foreground = BinaryReader_readBool32(reader);
-        bg->backgroundDefinition = BinaryReader_readInt32(reader);
+        if (dw->gen8.bytecodeVersion < 15) {
+            bg->backgroundDefinition = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveBGND);
+        } else {
+            bg->backgroundDefinition = BinaryReader_readInt32(reader);
+        }
         bg->x = BinaryReader_readInt32(reader);
         bg->y = BinaryReader_readInt32(reader);
         bg->tileX = BinaryReader_readInt32(reader);
@@ -1115,9 +1183,17 @@ static void readRoomGameObjects(BinaryReader* reader, DataWin* dw, Room* room) {
             RoomGameObject* go = &room->gameObjects[j];
             go->x = BinaryReader_readInt32(reader);
             go->y = BinaryReader_readInt32(reader);
-            go->objectDefinition = BinaryReader_readInt32(reader);
+            if (dw->gen8.bytecodeVersion < 15) {
+                go->objectDefinition = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveOBJT);
+            } else {
+                go->objectDefinition = BinaryReader_readInt32(reader);
+            }
             go->instanceID = BinaryReader_readUint32(reader);
-            go->creationCode = BinaryReader_readInt32(reader);
+            if (dw->gen8.bytecodeVersion < 15) {
+                go->creationCode = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveCODE);
+            } else {
+                go->creationCode = BinaryReader_readInt32(reader);
+            }
             go->scaleX = BinaryReader_readFloat32(reader);
             go->scaleY = BinaryReader_readFloat32(reader);
             if (DataWin_isVersionAtLeast(dw, 2, 2, 2, 302)) {
@@ -1153,7 +1229,11 @@ static void readRoomTiles(BinaryReader* reader, DataWin* dw, Room* room) {
             tile->x = BinaryReader_readInt32(reader);
             tile->y = BinaryReader_readInt32(reader);
             tile->useSpriteDefinition = DataWin_isVersionAtLeast(dw, 2, 0, 0, 0);
-            tile->backgroundDefinition = BinaryReader_readInt32(reader);
+            if (dw->gen8.bytecodeVersion < 15) {
+                tile->backgroundDefinition = resolveReference(dw, (uint32_t)BinaryReader_readInt32(reader), DataWin_resolveBGND);
+            } else {
+                tile->backgroundDefinition = BinaryReader_readInt32(reader);
+            }
             tile->sourceX = BinaryReader_readInt32(reader);
             tile->sourceY = BinaryReader_readInt32(reader);
             tile->width = BinaryReader_readUint32(reader);
@@ -1339,7 +1419,7 @@ static void readRoomPayload(BinaryReader* reader, DataWin* dw, Room* room) {
     require(!room->payloadLoaded);
 
     BinaryReader_seek(reader, room->backgroundsFileOffset);
-    readRoomBackgrounds(reader, room);
+    readRoomBackgrounds(reader, dw, room);
 
     BinaryReader_seek(reader, room->viewsFileOffset);
     readRoomViews(reader, room);
@@ -1612,25 +1692,35 @@ static void parseCODE(BinaryReader* reader, DataWin* dw, uint32_t chunkLength, s
         CodeEntry* entry = &c->entries[i];
         entry->name = readStringPtr(reader, dw);
         entry->length = BinaryReader_readUint32(reader);
-        entry->localsCount = BinaryReader_readUint16(reader);
-        entry->argumentsCount = BinaryReader_readUint16(reader);
 
-        // bytecodeRelAddr is relative to the position of this field
-        size_t relAddrFieldPos = BinaryReader_getPosition(reader);
-        int32_t bytecodeRelAddr = BinaryReader_readInt32(reader);
-        entry->bytecodeAbsoluteOffset = (uint32_t)((int64_t)relAddrFieldPos + bytecodeRelAddr);
+        if (dw->gen8.bytecodeVersion >= 15) {
+            entry->localsCount = BinaryReader_readUint16(reader);
+            entry->argumentsCount = BinaryReader_readUint16(reader);
 
-        entry->offset = BinaryReader_readUint32(reader);
+            // bytecodeRelAddr is relative to the position of this field
+            size_t relAddrFieldPos = BinaryReader_getPosition(reader);
+            int32_t bytecodeRelAddr = BinaryReader_readInt32(reader);
+            entry->bytecodeAbsoluteOffset = (uint32_t)((int64_t)relAddrFieldPos + bytecodeRelAddr);
+
+            entry->offset = BinaryReader_readUint32(reader);
+        } else {
+            entry->localsCount = 0;
+            entry->argumentsCount = 0;
+            entry->bytecodeAbsoluteOffset = (uint32_t)BinaryReader_getPosition(reader);
+            entry->offset = 0;
+        }
     }
-    free(codePtrs);
 
     // Compute bytecode blob range and load into owned buffer.
-    // The bytecode blob starts at the minimum bytecodeAbsoluteOffset and
-    // extends to the end of the CODE chunk.
-    uint32_t blobStart = c->entries[0].bytecodeAbsoluteOffset;
-    repeat(codeCount, i) {
-        if (c->entries[i].bytecodeAbsoluteOffset < blobStart) {
-            blobStart = c->entries[i].bytecodeAbsoluteOffset;
+    // In GMS 2 (BC15+), instructions are in a separate blob at the end of the chunk.
+    // In GMS 1.4 (BC14), instructions are interleaved with metadata.
+    // To keep it simple, we just load the whole chunk data range.
+    uint32_t blobStart = dw->gen8.bytecodeVersion >= 15 ? c->entries[0].bytecodeAbsoluteOffset : (uint32_t)chunkDataStart;
+    if (dw->gen8.bytecodeVersion >= 15) {
+        repeat(codeCount, i) {
+            if (c->entries[i].bytecodeAbsoluteOffset < blobStart) {
+                blobStart = c->entries[i].bytecodeAbsoluteOffset;
+            }
         }
     }
     size_t chunkEnd = chunkDataStart + chunkLength;
@@ -1638,26 +1728,46 @@ static void parseCODE(BinaryReader* reader, DataWin* dw, uint32_t chunkLength, s
 
     dw->bytecodeBufferBase = blobStart;
     dw->bytecodeBuffer = BinaryReader_readBytesAt(reader, blobStart, blobSize);
+
+    // Populate codeOffsetMap for BC14 pointer resolution
+    if (dw->gen8.bytecodeVersion < 15) {
+        repeat(codeCount, i) {
+            hmput(dw->codeOffsetMap, codePtrs[i], (int32_t)i);
+        }
+    }
+
+    free(codePtrs);
 }
 
 static void parseVARI(BinaryReader* reader, DataWin* dw, uint32_t chunkLength) {
     Vari* v = &dw->vari;
 
-    v->varCount1 = BinaryReader_readUint32(reader);
-    v->varCount2 = BinaryReader_readUint32(reader);
-    v->maxLocalVarCount = BinaryReader_readUint32(reader);
-
-    // Variable entries are packed sequentially (no pointer table)
-    // Number of entries = (chunkLength - 12) / 20
-    v->variableCount = (chunkLength - 12) / 20;
+    if (dw->gen8.bytecodeVersion >= 15) {
+        v->varCount1 = BinaryReader_readUint32(reader);
+        v->varCount2 = BinaryReader_readUint32(reader);
+        v->maxLocalVarCount = BinaryReader_readUint32(reader);
+        // Variable entries are packed sequentially (no pointer table)
+        // Number of entries = (chunkLength - 12) / 20
+        v->variableCount = (chunkLength - 12) / 20;
+    } else {
+        v->varCount1 = 0;
+        v->varCount2 = 0;
+        v->maxLocalVarCount = 0;
+        v->variableCount = chunkLength / 12;
+    }
 
     if (v->variableCount > 0) {
         v->variables = safeMalloc(v->variableCount * sizeof(Variable));
         repeat(v->variableCount, i) {
             Variable* var = &v->variables[i];
             var->name = readStringPtr(reader, dw);
-            var->instanceType = BinaryReader_readInt32(reader);
-            var->varID = BinaryReader_readInt32(reader);
+            if (dw->gen8.bytecodeVersion >= 15) {
+                var->instanceType = BinaryReader_readInt32(reader);
+                var->varID = BinaryReader_readInt32(reader);
+            } else {
+                var->instanceType = 0; // Undefined/Normal
+                var->varID = 0;
+            }
             var->occurrences = BinaryReader_readUint32(reader);
             var->firstAddress = BinaryReader_readUint32(reader);
         }
@@ -1666,11 +1776,16 @@ static void parseVARI(BinaryReader* reader, DataWin* dw, uint32_t chunkLength) {
     }
 }
 
-static void parseFUNC(BinaryReader* reader, DataWin* dw) {
+static void parseFUNC(BinaryReader* reader, DataWin* dw, uint32_t chunkLength) {
     Func* f = &dw->func;
 
     // Part 1: Functions SimpleList
-    f->functionCount = BinaryReader_readUint32(reader);
+    if (dw->gen8.bytecodeVersion >= 15) {
+        f->functionCount = BinaryReader_readUint32(reader);
+    } else {
+        f->functionCount = chunkLength / 12;
+    }
+
     if (f->functionCount > 0) {
         f->functions = safeMalloc(f->functionCount * sizeof(Function));
         repeat(f->functionCount, i) {
@@ -1687,26 +1802,28 @@ static void parseFUNC(BinaryReader* reader, DataWin* dw) {
         f->functions = nullptr;
     }
 
-    // Part 2: Code Locals SimpleList
-    f->codeLocalsCount = BinaryReader_readUint32(reader);
-    if (f->codeLocalsCount > 0) {
-        f->codeLocals = safeMalloc(f->codeLocalsCount * sizeof(CodeLocals));
-        repeat(f->codeLocalsCount, i) {
-            CodeLocals* cl = &f->codeLocals[i];
-            cl->localVarCount = BinaryReader_readUint32(reader);
-            cl->name = readStringPtr(reader, dw);
-
-            if (cl->localVarCount > 0) {
-                cl->locals = safeMalloc(cl->localVarCount * sizeof(LocalVar));
-                repeat(cl->localVarCount, j) {
-                    cl->locals[j].varID = BinaryReader_readUint32(reader);
-                    cl->locals[j].name = readStringPtr(reader, dw);
+    // Part 2: CodeLocals SimpleList (GMS 2 only)
+    if (dw->gen8.bytecodeVersion >= 15) {
+        f->codeLocalsCount = BinaryReader_readUint32(reader);
+        if (f->codeLocalsCount > 0) {
+            f->codeLocals = safeMalloc(f->codeLocalsCount * sizeof(CodeLocals));
+            repeat(f->codeLocalsCount, i) {
+                CodeLocals* cl = &f->codeLocals[i];
+                cl->localVarCount = BinaryReader_readUint32(reader);
+                cl->name = readStringPtr(reader, dw);
+                if (cl->localVarCount > 0) {
+                    cl->locals = safeMalloc(cl->localVarCount * sizeof(LocalVar));
+                    repeat(cl->localVarCount, j) {
+                        cl->locals[j].varID = BinaryReader_readUint32(reader);
+                        cl->locals[j].name = readStringPtr(reader, dw);
+                    }
                 }
-            } else {
-                cl->locals = nullptr;
             }
+        } else {
+            f->codeLocals = nullptr;
         }
     } else {
+        f->codeLocalsCount = 0;
         f->codeLocals = nullptr;
     }
 }
@@ -2037,7 +2154,7 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         } else if (options.parseVari && memcmp(chunkName, "VARI", 4) == 0) {
             parseVARI(&reader, dw, chunkLength);
         } else if (options.parseFunc && memcmp(chunkName, "FUNC", 4) == 0) {
-            parseFUNC(&reader, dw);
+            parseFUNC(&reader, dw, chunkLength);
         } else if (options.parseStrg && memcmp(chunkName, "STRG", 4) == 0) {
             parseSTRG(&reader, dw);
         } else if (options.parseTxtr && memcmp(chunkName, "TXTR", 4) == 0) {
@@ -2142,6 +2259,10 @@ void DataWin_free(DataWin* dw) {
             if (i >= dw->sprt.parsedCount) free((char*) dw->sprt.sprites[i].name);
         }
         free(dw->sprt.sprites);
+        hmfree(dw->sprtOffsetMap);
+        hmfree(dw->codeOffsetMap);
+        hmfree(dw->objtOffsetMap);
+        hmfree(dw->bgndOffsetMap);
     }
 
 
@@ -2335,6 +2456,50 @@ void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex) {
 
     BinaryReader lazyReader = BinaryReader_create(f, fileSize);
     readRoomPayload(&lazyReader, dw, room);
+}
+
+// ===[ TPAG Offset Resolution ]===
+
+int32_t DataWin_resolveTPAG(DataWin* dw, uint32_t offset) {
+    ptrdiff_t idx = hmgeti(dw->tpagOffsetMap, offset);
+    if (0 > idx) return -1;
+    return dw->tpagOffsetMap[idx].value;
+}
+
+// ===[ SPRT Offset Resolution ]===
+
+int32_t DataWin_resolveSPRT(DataWin* dw, uint32_t offset) {
+    if (offset == 0) return -1;
+    ptrdiff_t idx = hmgeti(dw->sprtOffsetMap, offset);
+    if (0 > idx) return -1;
+    return dw->sprtOffsetMap[idx].value;
+}
+
+// ===[ CODE Offset Resolution ]===
+
+int32_t DataWin_resolveCODE(DataWin* dw, uint32_t offset) {
+    if (offset == 0) return -1;
+    ptrdiff_t idx = hmgeti(dw->codeOffsetMap, offset);
+    if (0 > idx) return -1;
+    return dw->codeOffsetMap[idx].value;
+}
+
+// ===[ OBJT Offset Resolution ]===
+
+int32_t DataWin_resolveOBJT(DataWin* dw, uint32_t offset) {
+    if (offset == 0) return -1;
+    ptrdiff_t idx = hmgeti(dw->objtOffsetMap, offset);
+    if (0 > idx) return -1;
+    return dw->objtOffsetMap[idx].value;
+}
+
+// ===[ BGND Offset Resolution ]===
+
+int32_t DataWin_resolveBGND(DataWin* dw, uint32_t offset) {
+    if (offset == 0) return -1;
+    ptrdiff_t idx = hmgeti(dw->bgndOffsetMap, offset);
+    if (0 > idx) return -1;
+    return dw->bgndOffsetMap[idx].value;
 }
 
 // ===[ Dynamic Sprite Slot Allocation ]===

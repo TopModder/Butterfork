@@ -840,7 +840,10 @@ static bool isObjectDisabled(Runner* runner, int32_t objectIndex) {
 
 static Instance* createAndInitInstance(Runner* runner, int32_t instanceId, int32_t objectIndex, GMLReal x, GMLReal y) {
     DataWin* dataWin = runner->dataWin;
-    require(objectIndex >= 0 && dataWin->objt.count > (uint32_t) objectIndex);
+    if (objectIndex < 0 || (uint32_t)objectIndex >= dataWin->objt.count) {
+        fprintf(stderr, "Runner: WARNING: Skipping instance %d with invalid object index %d\n", instanceId, objectIndex);
+        return nullptr;
+    }
 
     GameObject* objDef = &dataWin->objt.objects[objectIndex];
 
@@ -1105,6 +1108,7 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         if (isObjectDisabled(runner, roomObj->objectDefinition)) continue;
 
         Instance* inst = createAndInitInstance(runner, roomObj->instanceID, roomObj->objectDefinition, (GMLReal) roomObj->x, (GMLReal) roomObj->y);
+        if (inst == nullptr) continue;
         inst->imageXscale = (float) roomObj->scaleX;
         inst->imageYscale = (float) roomObj->scaleY;
         inst->imageAngle = (float) roomObj->rotation;

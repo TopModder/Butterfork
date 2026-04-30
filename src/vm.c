@@ -16,7 +16,7 @@
 #include "stb_ds.h"
 
 // Maximum number of local variables per code entry (stack-allocated arrays in VM_executeCode/VM_callCodeIndex)
-#define MAX_CODE_LOCALS 128
+#define MAX_CODE_LOCALS 2048
 
 // ===[ Stack Operations ]===
 
@@ -214,6 +214,91 @@ static void patchReferenceOperands(VMContext* ctx) {
             if (f->occurrences > occ + 1) {
                 addr += delta;
             }
+        }
+    }
+}
+
+static void convertBytecode14ToModern(VMContext* ctx) {
+    DataWin* dw = ctx->dataWin;
+    uint8_t* buf = dw->bytecodeBuffer;
+    size_t base = dw->bytecodeBufferBase;
+
+    repeat(dw->code.count, codeIdx) {
+        CodeEntry* entry = &dw->code.entries[codeIdx];
+        if (entry->length == 0) continue;
+
+        uint32_t ip = entry->bytecodeAbsoluteOffset;
+        uint32_t end = ip + entry->length;
+
+        while (ip < end) {
+            uint32_t instrAddr = ip;
+            uint32_t instr = BinaryUtils_readUint32(&buf[instrAddr - base]);
+            uint8_t oldKind = (instr >> 24) & 0xFF;
+            uint8_t type1 = (instr >> 16) & 0x0F;
+
+            uint8_t newKind = oldKind;
+            switch (oldKind) {
+                case 0x03: newKind = OP_CONV; break;
+                case 0x04: newKind = OP_MUL; break;
+                case 0x05: newKind = OP_DIV; break;
+                case 0x06: newKind = OP_REM; break;
+                case 0x07: newKind = OP_MOD; break;
+                case 0x08: newKind = OP_ADD; break;
+                case 0x09: newKind = OP_SUB; break;
+                case 0x0A: newKind = OP_AND; break;
+                case 0x0B: newKind = OP_OR; break;
+                case 0x0C: newKind = OP_XOR; break;
+                case 0x0D: newKind = OP_NEG; break;
+                case 0x0E: newKind = OP_NOT; break;
+                case 0x0F: newKind = OP_SHL; break;
+                case 0x10: newKind = OP_SHR; break;
+                case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16:
+                    newKind = OP_CMP;
+                    // Move comparison kind to bits 8-15
+                    instr = (instr & 0xFF0000FF) | ((uint32_t)(oldKind - 0x10) << 8);
+                    break;
+                case 0x41: newKind = OP_POP; break;
+                case 0x82: newKind = OP_DUP; break;
+                case 0x9D: newKind = OP_RET; break;
+                case 0x9E: newKind = OP_EXIT; break;
+                case 0x9F: newKind = OP_POPZ; break;
+                case 0xB7: newKind = OP_B; break;
+                case 0xB8: newKind = OP_BT; break;
+                case 0xB9: newKind = OP_BF; break;
+                case 0xBB: newKind = OP_PUSHENV; break;
+                case 0xBC: newKind = OP_POPENV; break;
+                case 0xDA: newKind = OP_CALL; break;
+                case 0xC0:
+                    if (type1 == GML_TYPE_INT16) {
+                        newKind = OP_PUSHI;
+                    }
+                    break;
+            }
+
+            if (newKind != oldKind || oldKind == 0x11 || oldKind == 0x12 || oldKind == 0x13 || oldKind == 0x14 || oldKind == 0x16) {
+                instr = (instr & 0x00FFFFFF) | ((uint32_t)newKind << 24);
+                BinaryUtils_writeUint32(&buf[instrAddr - base], instr);
+            }
+
+            // Determine size to advance ip
+            uint32_t size = 4;
+            switch (newKind) {
+                case OP_PUSH: case OP_PUSHLOC: case OP_PUSHGLB: case OP_PUSHBLTN:
+                    if (type1 == GML_TYPE_INT16) size = 4;
+                    else if (type1 == GML_TYPE_DOUBLE || type1 == GML_TYPE_INT64) size = 12;
+                    else size = 8;
+                    break;
+                case OP_POP:
+                    size = (type1 == GML_TYPE_INT16) ? 4 : 8;
+                    break;
+                case OP_CALL:
+                    size = 8;
+                    break;
+                case 0xFF: // BREAK
+                    size = (type1 == GML_TYPE_INT32) ? 8 : 4;
+                    break;
+            }
+            ip += size;
         }
     }
 }
@@ -478,19 +563,18 @@ static Variable* resolveVarDef(VMContext* ctx, uint32_t varRef) {
 // We key by that shared varID via the precomputed currentCodeLocalsSlotMap so reads/writes via any VARI
 // entry agree on the same localVars slot.
 static uint32_t resolveLocalSlot(VMContext* ctx, int32_t varID) {
+    uint32_t slot;
     if (IS_BC16_OR_BELOW(ctx)) {
-        return (uint32_t) varID;
+        slot = (uint32_t) varID;
+    } else {
+        // For BC17, we'll allocate the slot dynamically because the data.win CANNOT be trusted to know how localVars the script has
+        slot = IntIntHashMap_getOrInsertSequential(ctx->currentCodeLocalsSlotMap, varID);
     }
-
-    // For BC17, we'll allocate the slot dynamically because the data.win CANNOT be trusted to know how localVars the script has
-    uint32_t slot = IntIntHashMap_getOrInsertSequential(ctx->currentCodeLocalsSlotMap, varID);
-    // Even though we are dynamically allocating the slots, we are still bound to whatever localVars is allocated to
-    // So, if a script goes over the MAX_CODE_LOCALS, it would cause unforeseen consequences...
-    requireMessage(MAX_CODE_LOCALS > slot, "resolveLocalSlot: exceeded MAX_CODE_LOCALS while allocating a slot for an array-only local");
 
     // Grow this frame's localVars window to cover `slot` whether the entry is pre-existing or freshly allocated.
     // Pre-existing entries can still be past ctx->localVarCount if a nested call to the same code extended the slot map while the outer frame was suspended (the outer frame's localVarCount is captured at call entry and doesn't follow later growth).
     if (slot >= ctx->localVarCount) {
+        requireMessageFormatted(MAX_CODE_LOCALS > slot, "resolveLocalSlot: local slot index %u exceeds MAX_CODE_LOCALS (%d) in script %s", slot, MAX_CODE_LOCALS, ctx->currentCodeName);
         for (uint32_t i = ctx->localVarCount; slot >= i; i++) {
             ctx->localVars[i] = (RValue){ .type = RVALUE_UNDEFINED };
         }
@@ -1056,10 +1140,6 @@ static void resolveVariableWrite(VMContext* ctx, int32_t instanceType, uint32_t 
         return;
     }
 
-#ifdef ENABLE_VM_TRACING
-    bool shouldLogGlobal = false;
-    bool shouldLogInstance = false;
-#endif
 
     switch (instanceType) {
         case INSTANCE_LOCAL: {
@@ -1312,7 +1392,7 @@ static inline RValue coerceIntStoreToReal(RValue val, uint8_t type2) {
     return val;
 }
 
-static void handlePop(VMContext* ctx, uint32_t instr, uint8_t type1, uint8_t type2, uint32_t varRef, uint8_t varType, int32_t instanceType) {
+static void handlePop(VMContext* ctx, MAYBE_UNUSED uint32_t instr, uint8_t type1, uint8_t type2, uint32_t varRef, uint8_t varType, int32_t instanceType) {
     RValue val;
     int32_t arrayIndex = -1;
 
@@ -3186,25 +3266,41 @@ VMContext* VM_create(DataWin* dataWin) {
     // Pre-resolve built-in variable IDs (replaces runtime strcmp chains with O(1) switch dispatch)
     repeat(dataWin->vari.variableCount, i) {
         Variable* var = &dataWin->vari.variables[i];
-        // varID == -6 is the BC16 built-in sentinel.
-        // In BC17, argument variables have instanceType == -6 (Builtin) with varID >= 0, so we also check instanceType.
-        if (var->varID == -6 || var->instanceType == -6) {
+        if (dataWin->gen8.bytecodeVersion < 15) {
             var->builtinVarId = VMBuiltins_resolveBuiltinVarId(var->name);
+            if (var->builtinVarId != BUILTIN_VAR_UNKNOWN) {
+                var->varID = -6; // mark as built-in
+            } else {
+                var->varID = (int32_t)i;
+            }
         } else {
-            var->builtinVarId = BUILTIN_VAR_UNKNOWN;
+            // varID == -6 is the BC16 built-in sentinel.
+            // In BC17, argument variables have instanceType == -6 (Builtin) with varID >= 0, so we also check instanceType.
+            if (var->varID == -6 || var->instanceType == -6) {
+                var->builtinVarId = VMBuiltins_resolveBuiltinVarId(var->name);
+            } else {
+                var->builtinVarId = BUILTIN_VAR_UNKNOWN;
+            }
         }
     }
 
     // Build reference lookup maps (file buffer stays read-only)
+    if (dataWin->gen8.bytecodeVersion < 15) {
+        convertBytecode14ToModern(ctx);
+    }
     patchReferenceOperands(ctx);
 
     // Scan VARI entries to find max varID for global scope
     // Built-in variables have varID == -6 (sentinel), skip those
     uint32_t maxGlobalVarID = 0;
-    forEach(Variable, v, dataWin->vari.variables, dataWin->vari.variableCount) {
-        if (0 > v->varID) continue;
-        if (v->instanceType == INSTANCE_GLOBAL) {
-            if ((uint32_t) v->varID + 1 > maxGlobalVarID) maxGlobalVarID = (uint32_t) v->varID + 1;
+    if (dataWin->gen8.bytecodeVersion < 15) {
+        maxGlobalVarID = dataWin->vari.variableCount;
+    } else {
+        forEach(Variable, v, dataWin->vari.variables, dataWin->vari.variableCount) {
+            if (0 > v->varID) continue;
+            if (v->instanceType == INSTANCE_GLOBAL) {
+                if ((uint32_t) v->varID + 1 > maxGlobalVarID) maxGlobalVarID = (uint32_t) v->varID + 1;
+            }
         }
     }
 
@@ -3656,7 +3752,7 @@ static void disasmFormatVar(VMContext* ctx, const uint8_t* extraData, const char
 }
 
 // Returns stack effect comment for a variable access instruction
-static void disasmFormatVarComment(VMContext* ctx, const uint8_t* extraData, bool isPop, char* buf, size_t bufSize) {
+static void disasmFormatVarComment(MAYBE_UNUSED VMContext* ctx, const uint8_t* extraData, bool isPop, char* buf, size_t bufSize) {
     uint32_t varRef = resolveVarOperand(extraData);
     uint8_t varType = (varRef >> 24) & 0xF8;
     if (isPop) {

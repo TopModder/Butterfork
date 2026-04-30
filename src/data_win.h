@@ -837,6 +837,17 @@ typedef struct DataWin {
 
     DetectedFormat detectedFormat;
 
+    // Lookup map: absolute file offset -> TPAG index (built during TPAG parsing)
+    struct { uint32_t key; int32_t value; }* tpagOffsetMap;
+    // Lookup map: absolute file offset -> SPRT index (built during SPRT parsing)
+    struct { uint32_t key; int32_t value; }* sprtOffsetMap;
+    // Lookup map: absolute file offset -> CODE index (built during CODE parsing, for BC14)
+    struct { uint32_t key; int32_t value; }* codeOffsetMap;
+    // Lookup map: absolute file offset -> OBJT index (built during OBJT parsing, for BC14)
+    struct { uint32_t key; int32_t value; }* objtOffsetMap;
+    // Lookup map: absolute file offset -> BGND index (built during BGND parsing, for BC14)
+    struct { uint32_t key; int32_t value; }* bgndOffsetMap;
+
     // Held open across the whole session when DataWinParserOptions.lazyLoadRooms is true.
     // Used by DataWin_loadRoomPayload to satisfy on-demand room payload reads.
     // nullptr when lazy loading is disabled. Closed by DataWin_free.
@@ -851,6 +862,11 @@ void DataWin_printDebugSummary(DataWin* dataWin);
 // Lazy room payload management. DataWin_loadRoomPayload is a no-op when the payload is already loaded.
 void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex);
 void DataWin_freeRoomPayload(Room* room);
+int32_t DataWin_resolveTPAG(DataWin* dw, uint32_t offset);
+int32_t DataWin_resolveSPRT(DataWin* dw, uint32_t offset);
+int32_t DataWin_resolveCODE(DataWin* dw, uint32_t offset);
+int32_t DataWin_resolveOBJT(DataWin* dw, uint32_t offset);
+int32_t DataWin_resolveBGND(DataWin* dw, uint32_t offset);
 // Finds a reusable dynamic Sprite slot (textureCount == 0) at or above `startIndex`, or appends a new one.
 uint32_t DataWin_allocSpriteSlot(DataWin* dw, uint32_t startIndex);
 // Compares the detected effective GMS version (not the raw GEN8 version) against a lower bound.

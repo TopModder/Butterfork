@@ -120,6 +120,7 @@ static void maDestroy(AudioSystem* audio) {
     }
 
     ma_engine_uninit(&ma->engine);
+    arrfree(ma->base.audioGroups);
     free(ma);
 }
 
@@ -201,12 +202,19 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
 
         if (isEmbedded || isCompressed) {
             // Embedded audio: decode from AUDO chunk memory
-            if (0 > sound->audioFile || (uint32_t) sound->audioFile >= ma->base.audioGroups[sound->audioGroup]->audo.count) {
-                fprintf(stderr, "Audio: Invalid audio file index %d for sound '%s'\n", sound->audioFile, sound->name);
+            int32_t groupIdx = sound->audioGroup;
+            if (0 > groupIdx || groupIdx >= (int32_t)arrlen(ma->base.audioGroups)) {
+                fprintf(stderr, "Audio: ERROR: Sound '%s' has invalid audioGroup %d (total groups: %d)\n", sound->name, groupIdx, (int32_t)arrlen(ma->base.audioGroups));
                 return -1;
             }
 
-            AudioEntry* entry = &ma->base.audioGroups[sound->audioGroup]->audo.entries[sound->audioFile];
+            DataWin* group = ma->base.audioGroups[groupIdx];
+            if (0 > sound->audioFile || (uint32_t) sound->audioFile >= group->audo.count) {
+                fprintf(stderr, "Audio: Invalid audio file index %d for sound '%s' in group %d\n", sound->audioFile, sound->name, groupIdx);
+                return -1;
+            }
+
+            AudioEntry* entry = &group->audo.entries[sound->audioFile];
 
             ma_decoder_config decoderConfig = ma_decoder_config_init_default();
             result = ma_decoder_init_memory(entry->data, entry->dataSize, &decoderConfig, &slot->decoder);
