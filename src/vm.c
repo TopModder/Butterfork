@@ -3407,12 +3407,19 @@ VMContext* VM_create(DataWin* dataWin) {
     ctx->funcCallCache = safeMalloc(dataWin->func.functionCount * sizeof(FuncCallCache));
     repeat(dataWin->func.functionCount, i) {
         const char* name = dataWin->func.functions[i].name;
-        BuiltinFunc builtin = VM_findBuiltin(ctx, name);
+        BuiltinFunc builtin = VM_findBuiltin(ctx, name);  
         ctx->funcCallCache[i].builtin = (void*) builtin;
         if (builtin != nullptr) {
             ctx->funcCallCache[i].scriptCodeIndex = -1;
         } else {
             ptrdiff_t mapIdx = shgeti(ctx->codeIndexByName, (char*) name);
+			
+			// Fallback for BC13 and BC14 (GM1.4 Games)
+			if (dataWin->gen8.bytecodeVersion <= 14 && mapIdx < 0) {
+				char svName[81];
+				snprintf(svName, sizeof(svName), "gml_Script_%s", name);
+				mapIdx = shgeti(ctx->codeIndexByName, svName);
+			}
             ctx->funcCallCache[i].scriptCodeIndex = (mapIdx >= 0) ? ctx->codeIndexByName[mapIdx].value : -1;
         }
     }
