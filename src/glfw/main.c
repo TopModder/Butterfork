@@ -1,5 +1,4 @@
 #include "data_win.h"
-#include "glfw/gl_legacy_renderer.h"
 #include "vm.h"
 
 #include <glad/glad.h>
@@ -23,7 +22,8 @@
 #include "input_recording.h"
 #include "debug_overlay.h"
 #include "gl_renderer.h"
-#include "glfw_file_system.h"
+#include "gl_legacy_renderer.h"
+#include "overlay_file_system.h"
 #include "ma_audio_system.h"
 #include "noop_audio_system.h"
 #include "stb_ds.h"
@@ -36,6 +36,7 @@ static void glfwErrorCallback(int code, const char* description) {
     fprintf(stderr, "GLFW error 0x%x: %s\n", code, description);
 }
 
+#ifndef ENABLE_GLES
 static void APIENTRY glDebugCallback(GLenum source, GLenum type, GLuint id, GLenum severity, MAYBE_UNUSED GLsizei length, const GLchar* message, MAYBE_UNUSED const void* userParam) {
     const char* sourceStr;
     switch (source) {
@@ -85,6 +86,7 @@ static void installGLDebugCallback(void) {
     glDebugMessageCallbackKHR(glDebugCallback, nullptr);
     glDebugMessageControlKHR(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
 }
+#endif
 
 // ===[ COMMAND LINE ARGUMENTS ]===
 typedef struct {
@@ -96,8 +98,11 @@ typedef struct {
 
 typedef struct {
     const char* dataWinPath;
+    const char* saveFolder; // null = default to the directory containing dataWinPath
     const char* screenshotPattern;
     FrameSetEntry* screenshotFrames;
+    const char* screenshotSurfacesPattern;
+    FrameSetEntry* screenshotSurfacesFrames;
     FrameSetEntry* dumpFrames;
     FrameSetEntry* dumpJsonFrames;
     const char* dumpJsonFilePattern;
@@ -107,6 +112,7 @@ typedef struct {
     StringBooleanEntry* alarmsToBeTraced;
     StringBooleanEntry* instanceLifecyclesToBeTraced;
     StringBooleanEntry* eventsToBeTraced;
+    StringBooleanEntry* collisionsToBeTraced;
     StringBooleanEntry* opcodesToBeTraced;
     StringBooleanEntry* stackToBeTraced;
     StringBooleanEntry* disassemble;
@@ -120,6 +126,7 @@ typedef struct {
     int exitAtFrame;
     int traceBytecodeAfterFrame;
     double speedMultiplier;
+    double fastForwardSpeed;
     int seed;
     bool hasSeed;
     bool debug;
@@ -188,6 +195,8 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
     static struct option longOptions[] = {
         {"screenshot",          required_argument, nullptr, 's'},
         {"screenshot-at-frame", required_argument, nullptr, 'f'},
+        {"screenshot-surfaces", required_argument, nullptr, 'U'},
+        {"screenshot-surfaces-at-frame", required_argument, nullptr, 'V'},
         {"headless",            no_argument,       nullptr, 'h'},
         {"print-rooms", no_argument,               nullptr, 'r'},
         {"print-declared-functions", no_argument,  nullptr, 'p'},
@@ -197,6 +206,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"trace-alarms", required_argument,         nullptr, 'a'},
         {"trace-instance-lifecycles", required_argument,         nullptr, 'l'},
         {"trace-events", required_argument,         nullptr, 'e'},
+        {"trace-collisions", required_argument,     nullptr, 'C'},
         {"trace-event-inherited", no_argument, nullptr, 'E'},
         {"trace-tiles", required_argument, nullptr, 'T'},
         {"trace-opcodes", required_argument,       nullptr, 'o'},
@@ -210,6 +220,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"dump-frame-json", required_argument, nullptr, 'j'},
         {"dump-frame-json-file", required_argument, nullptr, 'J'},
         {"speed", required_argument, nullptr, 'M'},
+        {"fast-forward-speed", required_argument, nullptr, 'X'},
         {"seed", required_argument, nullptr, 'Z'},
         {"debug", no_argument, nullptr, 'D'},
         {"disassemble", required_argument, nullptr, 'A'},
@@ -220,6 +231,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"eager-room", required_argument, nullptr, 'G'},
         {"os-type", required_argument, nullptr, 'O'},
         {"profile-gml-scripts", required_argument, nullptr, 'q'},
+        {"save-folder", required_argument, nullptr, 'B'},
 #ifdef ENABLE_VM_OPCODE_PROFILER
         {"profile-opcodes", no_argument, nullptr, 'Q'},
 #endif
@@ -230,6 +242,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
     args->exitAtFrame = -1;
     args->traceBytecodeAfterFrame = 0;
     args->speedMultiplier = 1.0;
+    args->fastForwardSpeed = 0.0;
     args->renderer = "gl";
     args->osType = OS_WINDOWS;
     args->profilerFramesBetween = 0;
@@ -249,6 +262,19 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
                 }
 
                 hmput(args->screenshotFrames, (int) frame, true);
+                break;
+            }
+            case 'U':
+                args->screenshotSurfacesPattern = optarg;
+                break;
+            case 'V': {
+                char* endPtr;
+                long frame = strtol(optarg, &endPtr, 10);
+                if (*endPtr != '\0' || 0 > frame) {
+                    fprintf(stderr, "Error: Invalid frame number '%s' for --screenshot-surfaces-at-frame\n", optarg);
+                    exit(1);
+                }
+                hmput(args->screenshotSurfacesFrames, (int) frame, true);
                 break;
             }
             case 'h':
@@ -277,6 +303,9 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
                 break;
             case 'e':
                 shput(args->eventsToBeTraced, optarg, true);
+                break;
+            case 'C':
+                shput(args->collisionsToBeTraced, optarg, true);
                 break;
             case 'o':
                 shput(args->opcodesToBeTraced, optarg, true);
@@ -346,6 +375,16 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
                 args->speedMultiplier = speed;
                 break;
             }
+            case 'X': {
+                char* endPtr;
+                double speed = strtod(optarg, &endPtr);
+                if (*endPtr != '\0' || speed <= 0.0) {
+                    fprintf(stderr, "Error: Invalid speed '%s' for --fast-forward-speed (must be > 0)\n", optarg);
+                    exit(1);
+                }
+                args->fastForwardSpeed = speed;
+                break;
+            }
             case 'D':
                 args->debug = true;
                 break;
@@ -394,6 +433,9 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
                 args->profilerFramesBetween = (int) framesBetween;
                 break;
             }
+            case 'B':
+                args->saveFolder = optarg;
+                break;
 #ifdef ENABLE_VM_OPCODE_PROFILER
             case 'Q':
                 args->opcodeProfiler = true;
@@ -425,6 +467,11 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         exit(1);
     }
 
+    if (hmlen(args->screenshotSurfacesFrames) > 0 && args->screenshotSurfacesPattern == nullptr) {
+        fprintf(stderr, "Error: --screenshot-surfaces-at-frame requires --screenshot-surfaces to be set\n");
+        exit(1);
+    }
+
     if (args->headless && args->speedMultiplier != 1.0) {
         fprintf(stderr, "You can't set the speed multiplier while running in headless mode! Headless mode always run in real time\n");
         exit(1);
@@ -434,6 +481,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
 
 static void freeCommandLineArgs(CommandLineArgs* args) {
     hmfree(args->screenshotFrames);
+    hmfree(args->screenshotSurfacesFrames);
     hmfree(args->dumpFrames);
     hmfree(args->dumpJsonFrames);
     shfree(args->varReadsToBeTraced);
@@ -442,6 +490,7 @@ static void freeCommandLineArgs(CommandLineArgs* args) {
     shfree(args->alarmsToBeTraced);
     shfree(args->instanceLifecyclesToBeTraced);
     shfree(args->eventsToBeTraced);
+    shfree(args->collisionsToBeTraced);
     shfree(args->opcodesToBeTraced);
     shfree(args->stackToBeTraced);
     shfree(args->disassemble);
@@ -449,18 +498,24 @@ static void freeCommandLineArgs(CommandLineArgs* args) {
 }
 
 // ===[ SCREENSHOT ]===
-static void captureScreenshot(const char* filenamePattern, int frameNumber, int width, int height) {
-    char filename[512];
-    snprintf(filename, sizeof(filename), filenamePattern, frameNumber);
+// Reads the contents of an FBO (use 0 for the default framebuffer) into a PNG file.
+// If forceOpaque is true, the alpha channel is overwritten with 255, fixing any clobbering done by blending modes.
+static void writeFramebufferAsPng(GLuint fbo, int width, int height, const char* filename, const char* logPrefix, bool forceOpaque) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
 
     int stride = width * 4;
     unsigned char* pixels = safeMalloc(stride * height);
     if (pixels == nullptr) {
-        fprintf(stderr, "Error: Failed to allocate memory for screenshot (%dx%d)\n", width, height);
+        fprintf(stderr, "Error: Failed to allocate memory for %s (%dx%d)\n", logPrefix, width, height);
         return;
     }
 
     glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    if (forceOpaque) {
+        int totalPixels = width * height;
+        repeat(totalPixels, i) pixels[i * 4 + 3] = 255;
+    }
 
     // OpenGL reads bottom-to-top, but PNG is top-to-bottom.
     // Use stb's negative stride trick: point to the last row and use a negative stride to flip vertically.
@@ -468,7 +523,32 @@ static void captureScreenshot(const char* filenamePattern, int frameNumber, int 
     stbi_write_png(filename, width, height, 4, lastRow, -stride);
 
     free(pixels);
-    printf("Screenshot saved: %s\n", filename);
+    printf("%s: %s (%dx%d)\n", logPrefix, filename, width, height);
+}
+
+static void captureScreenshot(GLuint fbo, const char* filenamePattern, int frameNumber, int width, int height) {
+    char filename[512];
+    snprintf(filename, sizeof(filename), filenamePattern, frameNumber);
+    writeFramebufferAsPng(fbo, width, height, filename, "Screenshot saved", true);
+}
+
+// Dumps every live surface in the GL renderer as a PNG.
+// Filename pattern takes two %d slots: frame number, then surface ID.
+static void dumpAllSurfaces(GLRenderer* gl, const char* filenamePattern, int frameNumber) {
+    repeat(gl->ssurfaceCount, surfaceId) {
+        if (gl->surfaces[surfaceId] == 0)
+            continue;
+
+        int width = gl->surfaceWidth[surfaceId];
+        int height = gl->surfaceHeight[surfaceId];
+        if (0 >= width || 0 >= height) continue;
+
+        char filename[512];
+        snprintf(filename, sizeof(filename), filenamePattern, frameNumber, (int) surfaceId);
+        writeFramebufferAsPng(gl->surfaces[surfaceId], width, height, filename, "Surface dump", false);
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, gl->fbo);
 }
 
 // ===[ KEYBOARD INPUT ]===
@@ -580,7 +660,9 @@ static void characterCallback(GLFWwindow* window, unsigned int codepoint) {
 }
 
 static void setGlfwWindowTitle(void* window, const char* title) {
-    glfwSetWindowTitle((GLFWwindow*) window, title);
+    char windowTitle[256];
+    snprintf(windowTitle, sizeof(windowTitle), "Butterscotch - %s", title);
+    glfwSetWindowTitle((GLFWwindow*) window, windowTitle);
 }
 
 static bool getGlfwWindowFocus(void* window) {
@@ -751,7 +833,24 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize the file system
-    GlfwFileSystem* glfwFileSystem = GlfwFileSystem_create(args.dataWinPath);
+    char* dataWinDir = nullptr;
+    {
+        const char* lastSlash = strrchr(args.dataWinPath, '/');
+        const char* lastBackslash = strrchr(args.dataWinPath, '\\');
+        if (lastBackslash != nullptr && (lastSlash == nullptr || lastBackslash > lastSlash))
+            lastSlash = lastBackslash;
+        if (lastSlash != nullptr) {
+            size_t len = (size_t) (lastSlash - args.dataWinPath + 1);
+            dataWinDir = safeMalloc(len + 1);
+            memcpy(dataWinDir, args.dataWinPath, len);
+            dataWinDir[len] = '\0';
+        } else {
+            dataWinDir = safeStrdup("./");
+        }
+    }
+    const char* savePath = args.saveFolder != nullptr ? args.saveFolder : dataWinDir;
+    OverlayFileSystem* overlayFs = OverlayFileSystem_create(dataWinDir, savePath);
+    free(dataWinDir);
 
     // Init GLFW
     glfwSetErrorCallback(glfwErrorCallback);
@@ -763,15 +862,27 @@ int main(int argc, char* argv[]) {
     }
 
     bool modernGL = strcmp(args.renderer, "legacy-gl") != 0;
+
+    if (!modernGL && hmlen(args.screenshotSurfacesFrames)) {
+        fprintf(stderr, "You can't use --screenshot-surfaces with --renderer legacy-gl!\n");
+        return 0;
+    }
+
     if (!modernGL) {
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 1);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
     } else {
+#ifdef ENABLE_GLES
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#else
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
         glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
+#endif
     }
 
     // Load SDL gamecontroller mappings
@@ -812,7 +923,11 @@ int main(int argc, char* argv[]) {
     glfwSwapInterval(0); // Disable v-sync, we control timing ourselves
 
     // Load OpenGL function pointers via GLAD
+#ifdef ENABLE_GLES
+    if (!gladLoadGLES2Loader((GLADloadproc) glfwGetProcAddress)) {
+#else
     if (!gladLoadGLLoader((GLADloadproc) glfwGetProcAddress)) {
+#endif
         fprintf(stderr, "Failed to initialize GLAD\n");
         glfwDestroyWindow(window);
         glfwTerminate();
@@ -822,15 +937,24 @@ int main(int argc, char* argv[]) {
     }
 
     // Install the OpenGL debug message callback
+#ifndef ENABLE_GLES
     if (modernGL)
         installGLDebugCallback();
+#endif
 
     // Initialize the renderer
     Renderer* renderer = nullptr;
+#ifdef ENABLE_GLES
+    if (strcmp(args.renderer, "legacy-gl") == 0) {
+        fprintf(stderr, "--renderer legacy-gl is not available in GLES builds; falling back to gl\n");
+    }
+    renderer = GLRenderer_create();
+#else
     if(strcmp(args.renderer, "legacy-gl") == 0)
         renderer = GLLegacyRenderer_create();
     else
         renderer = GLRenderer_create();
+#endif
 
     // Initialize the audio system
     AudioSystem* audioSystem = nullptr;
@@ -841,7 +965,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize the runner
-    Runner* runner = Runner_create(dataWin, vm, renderer, (FileSystem*) glfwFileSystem, audioSystem);
+    Runner* runner = Runner_create(dataWin, vm, renderer, (FileSystem*) overlayFs, audioSystem);
     runner->debugMode = args.debug;
     runner->osType = args.osType;
     runner->nativeWindow = window;
@@ -863,6 +987,7 @@ int main(int argc, char* argv[]) {
     shcopyFromTo(args.alarmsToBeTraced, runner->vmContext->alarmsToBeTraced);
     shcopyFromTo(args.instanceLifecyclesToBeTraced, runner->vmContext->instanceLifecyclesToBeTraced);
     shcopyFromTo(args.eventsToBeTraced, runner->vmContext->eventsToBeTraced);
+    shcopyFromTo(args.collisionsToBeTraced, runner->vmContext->collisionsToBeTraced);
     shcopyFromTo(args.opcodesToBeTraced, runner->vmContext->opcodesToBeTraced);
     shcopyFromTo(args.stackToBeTraced, runner->vmContext->stackToBeTraced);
     shcopyFromTo(args.tilesToBeTraced, runner->vmContext->tilesToBeTraced);
@@ -1037,8 +1162,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        Room* activeRoom = runner->currentRoom;
-
         // Query actual framebuffer size (differs from window size on Wayland with fractional scaling)
         int fbWidth, fbHeight;
         glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
@@ -1058,27 +1181,10 @@ int main(int argc, char* argv[]) {
         // The Port W/Port H controls the size of the game viewport within the application surface.
         // Think of it like if you had an image (or... well, a framebuffer) and you are "pasting" it over the application surface.
         // And the Port W/Port H are scaled by the window size too (set by the GEN8 chunk)
-        float displayScaleX = 1.0f;
-        float displayScaleY = 1.0f;
-        bool viewsEnabled = (activeRoom->flags & 1) != 0;
-        if (viewsEnabled) {
-            int32_t minLeft = INT32_MAX, minTop = INT32_MAX;
-            int32_t maxRight = INT32_MIN, maxBottom = INT32_MIN;
-            repeat(MAX_VIEWS, vi) {
-                RuntimeView* view = &runner->views[vi];
-                if (!view->enabled) continue;
-                if (minLeft > view->portX) minLeft = view->portX;
-                if (minTop > view->portY) minTop = view->portY;
-                int32_t right = view->portX + view->portWidth;
-                int32_t bottom = view->portY + view->portHeight;
-                if (right > maxRight) maxRight = right;
-                if (bottom > maxBottom) maxBottom = bottom;
-            }
-            if (maxRight > minLeft && maxBottom > minTop) {
-                displayScaleX = (float) gameW / (float) (maxRight - minLeft);
-                displayScaleY = (float) gameH / (float) (maxBottom - minTop);
-            }
-        }
+        float displayScaleX;
+        float displayScaleY;
+
+        Runner_computeViewDisplayScale(runner, gameW, gameH, &displayScaleX, &displayScaleY);
 
         renderer->vtable->beginFrame(renderer, gameW, gameH, fbWidth, fbHeight);
 
@@ -1093,62 +1199,7 @@ int main(int argc, char* argv[]) {
         }
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // Render each enabled view (or a default full-screen view if views are disabled)
-        bool anyViewRendered = false;
-
-        if (viewsEnabled) {
-            repeat(MAX_VIEWS, vi) {
-                RuntimeView* view = &runner->views[vi];
-                if (!view->enabled) continue;
-
-                int32_t viewX = view->viewX;
-                int32_t viewY = view->viewY;
-                int32_t viewW = view->viewWidth;
-                int32_t viewH = view->viewHeight;
-                int32_t portX = (int32_t) ((float) view->portX * displayScaleX + 0.5f);
-                int32_t portY = (int32_t) ((float) view->portY * displayScaleY + 0.5f);
-                int32_t portW = (int32_t) ((float) view->portWidth * displayScaleX + 0.5f);
-                int32_t portH = (int32_t) ((float) view->portHeight * displayScaleY + 0.5f);
-                float viewAngle = view->viewAngle;
-
-                runner->viewCurrent = vi;
-                renderer->vtable->beginView(renderer, viewX, viewY, viewW, viewH, portX, portY, portW, portH, viewAngle);
-
-                Runner_draw(runner);
-
-                if (debugShowCollisionMasks) DebugOverlay_drawCollisionMasks(runner);
-
-                renderer->vtable->endView(renderer);
-
-                int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : portW;
-                int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : portH;
-                renderer->vtable->beginGUI(renderer, guiW, guiH, portX, portY, portW, portH);
-                Runner_drawGUI(runner);
-                renderer->vtable->endGUI(renderer);
-
-                anyViewRendered = true;
-            }
-        }
-
-        if (!anyViewRendered) {
-            // No views enabled or views disabled: render with default full-screen view
-            runner->viewCurrent = 0;
-            renderer->vtable->beginView(renderer, 0, 0, gameW, gameH, 0, 0, gameW, gameH, 0.0f);
-            Runner_draw(runner);
-
-            if (debugShowCollisionMasks) DebugOverlay_drawCollisionMasks(runner);
-
-            renderer->vtable->endView(renderer);
-
-            int32_t guiW = runner->guiWidth > 0 ? runner->guiWidth : gameW;
-            int32_t guiH = runner->guiHeight > 0 ? runner->guiHeight : gameH;
-            renderer->vtable->beginGUI(renderer, guiW, guiH, 0, 0, gameW, gameH);
-            Runner_drawGUI(runner);
-            renderer->vtable->endGUI(renderer);
-        }
-
-        // Reset view_current to 0 so non-Draw events (Step, Alarm, Create) see view_current = 0
-        runner->viewCurrent = 0;
+        Runner_drawViews(runner, gameW, gameH, displayScaleX, displayScaleY, debugShowCollisionMasks);
 
         renderer->vtable->endFrame(renderer);
 
@@ -1156,13 +1207,18 @@ int main(int argc, char* argv[]) {
         bool shouldScreenshot = hmget(args.screenshotFrames, runner->frameCount);
 
         if (shouldScreenshot) {
-            // Bind FBO so glReadPixels reads from the game's native-resolution texture
+            GLuint readFbo = (strcmp(args.renderer, "legacy-gl") == 0) ? 0 : ((GLRenderer*) renderer)->fbo;
+            captureScreenshot(readFbo, args.screenshotPattern, runner->frameCount, gameW, gameH);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        }
+
+        // Dump all surfaces if this frame matches a requested frame
+        bool shouldDumpSurfaces = hmget(args.screenshotSurfacesFrames, runner->frameCount);
+
+        if (shouldDumpSurfaces) {
             GLRenderer* gl = (GLRenderer*) renderer;
-            if (!(strcmp(args.renderer, "legacy-gl") == 0))
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, gl->fbo);
-            captureScreenshot(args.screenshotPattern, runner->frameCount, gameW, gameH);
-            if (!(strcmp(args.renderer, "legacy-gl") == 0))
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            dumpAllSurfaces(gl, args.screenshotSurfacesPattern, runner->frameCount);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         }
 
         if (args.exitAtFrame >= 0 && runner->frameCount >= args.exitAtFrame) {
@@ -1179,7 +1235,16 @@ int main(int argc, char* argv[]) {
 
         // Limit frame rate to room speed (skip in headless mode for max speed!!)
         if (!args.headless && runner->currentRoom->speed > 0) {
-            double targetFrameTime = 1.0 / (runner->currentRoom->speed * args.speedMultiplier);
+            static bool fastForwardActive = false;
+            static bool fastForwardTabPrev = false;
+            bool fastForwardTabNow = glfwGetKey(window, GLFW_KEY_TAB) == GLFW_PRESS;
+            if (args.fastForwardSpeed > 0.0 && fastForwardTabNow && !fastForwardTabPrev) {
+                fastForwardActive = !fastForwardActive;
+                lastFrameTime = glfwGetTime();
+            }
+            fastForwardTabPrev = fastForwardTabNow;
+            double effectiveSpeed = (args.fastForwardSpeed > 0.0 && fastForwardActive) ? args.fastForwardSpeed : args.speedMultiplier;
+            double targetFrameTime = 1.0 / (runner->currentRoom->speed * effectiveSpeed);
             double nextFrameTime = lastFrameTime + targetFrameTime;
             // Sleep for most of the remaining time, then spin-wait for precision
             double remaining = nextFrameTime - glfwGetTime();
@@ -1214,7 +1279,7 @@ int main(int argc, char* argv[]) {
     glfwTerminate();
 
     Runner_free(runner);
-    GlfwFileSystem_destroy(glfwFileSystem);
+    OverlayFileSystem_destroy(overlayFs);
 #ifdef ENABLE_VM_OPCODE_PROFILER
     VM_printOpcodeProfilerReport(vm);
 #endif

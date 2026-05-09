@@ -2,7 +2,11 @@
 
 #include "common.h"
 #include "renderer.h"
+#ifdef __EMSCRIPTEN__
+#include <GLES3/gl3.h>
+#else
 #include <glad/glad.h>
+#endif
 
 // ===[ GLRenderer Struct ]===
 // Exposed in the header so platform-specific code (main.c) can access FBO fields for screenshots.
@@ -13,9 +17,12 @@ typedef struct {
     GLint uProjection;
     GLint uTexture;
     GLint uAlphaTestRef;
+    GLint uFogColor;
 
     bool alphaTestEnable;
     float alphaTestRef;
+    bool fogEnable;
+    uint32_t fogColor; // BGR
 
     GLuint vao, vbo, ebo;
     float* vertexData; // MAX_QUADS * VERTICES_PER_QUAD * FLOATS_PER_VERTEX floats
@@ -45,6 +52,14 @@ typedef struct {
     uint32_t originalTexturePageCount;
     uint32_t originalTpagCount;
     uint32_t originalSpriteCount;
+    //I am VERY Sorry This Code May Be Messy And Hacky
+    uint32_t surfaceCount;
+    GLuint* surfaces;
+    GLuint* surfaceTexture;
+    int32_t* surfaceWidth;
+    int32_t* surfaceHeight;
+    uint32_t ssurfaceCount;
+    int32_t surfaceStack[16];
 } GLRenderer;
 
 Renderer* GLRenderer_create(void);

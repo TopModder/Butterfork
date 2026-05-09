@@ -2,7 +2,14 @@
 #include "matrix_math.h"
 #include "text_utils.h"
 
+
+#ifdef PLATFORM_PS3
+#include "ps3gl.h"
+#include "rsxutil.h"
+GLAPI void GLAPIENTRY glActiveTexture( GLenum texture ) {};
+#else
 #include <glad/glad.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -195,6 +202,19 @@ static void glEndFrame(Renderer* renderer) {
 }
 
 static void glRendererFlush(MAYBE_UNUSED Renderer* renderer) {}
+
+static void glClearScreen(MAYBE_UNUSED Renderer* renderer, uint32_t color, float alpha) {
+    float r = (float) BGR_R(color) / 255.0f;
+    float g = (float) BGR_G(color) / 255.0f;
+    float b = (float) BGR_B(color) / 255.0f;
+
+    // GML draw_clear ignores the active scissor and clears the whole target. Disable scissor for the clear and restore it after.
+    GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    if (scissorWasEnabled) glDisable(GL_SCISSOR_TEST);
+    glClearColor(r, g, b, alpha);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (scissorWasEnabled) glEnable(GL_SCISSOR_TEST);
+}
 
 // Lazily decodes and uploads a TXTR page on first access.
 // Returns true if the texture is ready, false if it failed to decode.
@@ -826,25 +846,6 @@ static void glDrawTextColor(Renderer* renderer, const char* text, float x, float
     float cursorY = valignOffset - (float) font->ascenderOffset;
     int32_t lineStart = 0;
 
-    // get delta's  (16.16 format)
-	int32_t left_r_dx = ((_c2 & 0xff0000) - (_c1 & 0xff0000)) / textLen;
-	int32_t left_g_dx = ((((_c2 & 0xff00) << 8) - ((_c1 & 0xff00) << 8))) / textLen;
-	int32_t left_b_dx = ((((_c2 & 0xff) << 16) - ((_c1 & 0xff) << 16))) / textLen;
-
-	int32_t right_r_dx = ((_c3 & 0xff0000) - (_c4 & 0xff0000)) / textLen;
-	int32_t right_g_dx = ((((_c3 & 0xff00) << 8) - ((_c4 & 0xff00) << 8))) / textLen;
-	int32_t right_b_dx = ((((_c3 & 0xff) << 16) - ((_c4 & 0xff) << 16))) / textLen;
-
-    int32_t left_delta_r = left_r_dx;
-	int32_t left_delta_g = left_g_dx;
-	int32_t left_delta_b = left_b_dx;
-	int32_t right_delta_r = right_r_dx;
-	int32_t right_delta_g = right_g_dx;
-	int32_t right_delta_b = right_b_dx;
-
-    int32_t c1 = _c1;
-    int32_t c4 = _c4;
-
     for (int32_t lineIdx = 0; lineCount > lineIdx; lineIdx++) {
         // Find end of current line
         int32_t lineEnd = lineStart;
@@ -860,6 +861,8 @@ static void glDrawTextColor(Renderer* renderer, const char* text, float x, float
         else if (renderer->drawHalign == 2) halignOffset = -lineWidth;
 
         float cursorX = halignOffset;
+        // Pixel-position cursor for the gradient
+        float gradientX = 0.0f;
 
         // Render each glyph in the line - decode each codepoint once and carry it forward as next iteration's ch (also used for kerning)
         int32_t pos = 0;
@@ -871,21 +874,6 @@ static void glDrawTextColor(Renderer* renderer, const char* text, float x, float
         }
 
         while (hasCh) {
-            // do 16.16 maths
-            int32_t c2 = ((c1 & 0xff0000) + (left_delta_r & 0xff0000)) & 0xff0000;
-                c2 |= ((c1 & 0xff00) + (left_delta_g >> 8) & 0xff00) & 0xff00;
-                c2 |= ((c1 & 0xff) + (left_delta_b >> 16)) & 0xff;
-            int32_t c3 = ((c4 & 0xff0000) + (right_delta_r & 0xff0000)) & 0xff0000;
-                c3 |= ((c4 & 0xff00) + (right_delta_g >> 8) & 0xff00) & 0xff00;
-                c3 |= ((c4 & 0xff) + (right_delta_b >> 16)) & 0xff;
-
-            left_delta_r += left_r_dx;
-            left_delta_g += left_g_dx;
-            left_delta_b += left_b_dx;
-            right_delta_r += right_r_dx;
-            right_delta_g += right_g_dx;
-            right_delta_b += right_b_dx;
-
             FontGlyph* glyph = TextUtils_findGlyph(font, ch);
 
             uint16_t nextCh = 0;
@@ -893,6 +881,14 @@ static void glDrawTextColor(Renderer* renderer, const char* text, float x, float
             if (hasNext) nextCh = TextUtils_decodeUtf8(text + lineStart, lineLen, &pos);
 
             if (glyph != nullptr) {
+                float advance = (float) glyph->shift;
+                float leftFrac  = (lineWidth > 0.0f) ? (gradientX           / lineWidth) : 0.0f;
+                float rightFrac = (lineWidth > 0.0f) ? ((gradientX + advance) / lineWidth) : 1.0f;
+                int32_t c1 = Color_lerp(_c1, _c2, leftFrac);
+                int32_t c2 = Color_lerp(_c1, _c2, rightFrac);
+                int32_t c3 = Color_lerp(_c4, _c3, rightFrac);
+                int32_t c4 = Color_lerp(_c4, _c3, leftFrac);
+
                 bool drewSuccessfully = false;
                 if (glyph->sourceWidth != 0 && glyph->sourceHeight != 0) {
                     float u0, v0, u1, v1;
@@ -935,10 +931,11 @@ static void glDrawTextColor(Renderer* renderer, const char* text, float x, float
                 }
 
                 cursorX += glyph->shift;
-                if (drewSuccessfully) {
-                    if (hasNext) cursorX += TextUtils_getKerningOffset(glyph, nextCh);
-                    c4 = c3;    // set left edge to be what the last right edge was....
-                    c1 = c2;
+                gradientX   += glyph->shift;
+                if (drewSuccessfully && hasNext) {
+                    float kern = TextUtils_getKerningOffset(glyph, nextCh);
+                    cursorX += kern;
+                    gradientX   += kern;
                 }
             }
 
@@ -991,7 +988,7 @@ static uint32_t findOrAllocTpagSlot(DataWin* dw, uint32_t originalTpagCount) {
     return newIndex;
 }
 
-static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
+static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t surfaceID, int32_t x, int32_t y, int32_t w, int32_t h, bool removeback, bool smooth, int32_t xorig, int32_t yorig) {
     GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
     DataWin* dw = renderer->dataWin;
 
@@ -1003,7 +1000,11 @@ static int32_t glCreateSpriteFromSurface(Renderer* renderer, int32_t x, int32_t 
 
     // OpenGL Y is bottom-up, GML Y is top-down, so flip the Y coordinate
     int32_t glY = gl->gameH - y - h;
+#ifdef PLATFORM_PS3
+    memcpy(pixels, color_buffer[curr_fb ^ 1], display_height*color_pitch);
+#else
     glReadPixels(x, glY, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+#endif
 
     // Flip vertically (OpenGL reads bottom-to-top)
     size_t rowBytes = (size_t) w * 4;
@@ -1235,6 +1236,7 @@ static RendererVtable glVtable = {
     .drawText = glDrawText,
     .drawTextColor = glDrawTextColor,
     .flush = glRendererFlush,
+    .clearScreen = glClearScreen,
     .createSpriteFromSurface = glCreateSpriteFromSurface,
     .deleteSprite = glDeleteSprite,
     .gpuSetBlendMode = glGpuSetBlendMode,
@@ -1256,5 +1258,6 @@ Renderer* GLLegacyRenderer_create(void) {
     gl->base.drawFont = -1;
     gl->base.drawHalign = 0;
     gl->base.drawValign = 0;
+    gl->base.circlePrecision = 24;
     return (Renderer*) gl;
 }

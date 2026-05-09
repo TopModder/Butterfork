@@ -35,9 +35,20 @@ if(ENABLE_BC17)
     add_compile_definitions(ENABLE_BC17)
 endif()
 
-file(GLOB SOURCES src/*.c)
+if(PLATFORM STREQUAL "web-meta")
+    # Metadata-only build: just the data.win parser and its direct deps. No VM, no runner, no I/O subsystems.
+    set(SOURCES
+        src/data_win.c
+        src/binary_reader.c
+    )
+else()
+    file(GLOB SOURCES src/*.c)
+endif()
 # Platform specific files builds
 file(GLOB PLATFORM_SOURCES src/${PLATFORM}/*.c)
+
+# OpenGL ES 3.0 / WebGL2 compatibility
+option(ENABLE_GLES "Build the gl_renderer against OpenGL ES 3.0 / WebGL2 instead of desktop GL 4.1 Core" OFF)
 
 add_executable(butterscotch ${SOURCES} ${PLATFORM_SOURCES})
 target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -45,10 +56,20 @@ target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # stb_ds
 target_include_directories(butterscotch PUBLIC vendor/stb/ds)
 
+# RFC 1321 reference MD5 implementation
+target_sources(butterscotch PRIVATE vendor/md5/md5.c)
+target_include_directories(butterscotch PUBLIC vendor/md5)
+
 if(PLATFORM STREQUAL "glfw")
-    file(GLOB GL_SOURCES src/gl/*.c)
+    if(ENABLE_GLES)
+        file(GLOB GL_SOURCES src/gl/*.c src/image/*.c)
+    else()
+        file(GLOB GL_SOURCES src/gl/*.c src/image/*.c src/gl_legacy/*.c)
+    endif()
     target_sources(butterscotch PRIVATE ${GL_SOURCES})
     target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl_legacy)
 
     # Butterscotch VM/interpreter profiler
     option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" ON)
@@ -81,8 +102,14 @@ if(PLATFORM STREQUAL "glfw")
     endif()
 
     # GLAD
-    add_library(glad STATIC vendor/glad/src/glad.c)
-    target_include_directories(glad PUBLIC vendor/glad/include)
+    if(ENABLE_GLES)
+        add_compile_definitions(ENABLE_GLES)
+        add_library(glad STATIC vendor/glad-gles/src/glad.c)
+        target_include_directories(glad PUBLIC vendor/glad-gles/include)
+    else()
+        add_library(glad STATIC vendor/glad/src/glad.c)
+        target_include_directories(glad PUBLIC vendor/glad/include)
+    endif()
 
     # stb_image
     target_include_directories(butterscotch PUBLIC vendor/stb/image)
@@ -133,6 +160,63 @@ if(PLATFORM STREQUAL "glfw")
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${CMAKE_SOURCE_DIR}/vendor/gamecontrollerdb.txt
             $<TARGET_FILE_DIR:butterscotch>/gamecontrollerdb.txt
+    )
+elseif(PLATFORM STREQUAL "web")
+    file(GLOB GL_SOURCES src/gl/*.c src/image/*.c)
+    target_sources(butterscotch PRIVATE ${GL_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
+    add_compile_definitions(ENABLE_GLES)
+
+    # stb_image
+    target_include_directories(butterscotch PUBLIC vendor/stb/image)
+
+    # stb_vorbis (for miniaudio's OGG decoding)
+    target_include_directories(butterscotch PUBLIC vendor/stb/vorbis)
+
+    # miniaudio (used in noDevice mode; see src/web/web_audio_system.c)
+    target_include_directories(butterscotch PUBLIC vendor/miniaudio)
+
+    set_target_properties(butterscotch PROPERTIES SUFFIX ".mjs")
+
+    target_link_options(
+            butterscotch
+            PRIVATE
+            "-sMODULARIZE=1"
+            "-sEXPORT_ES6=1"
+            "-sENVIRONMENT=worker"
+            "-sWASMFS=1"
+            "-sEXPORTED_RUNTIME_METHODS=['HEAP8', 'HEAPU8', 'HEAPF32', 'ccall', 'cwrap', 'specialHTMLTargets', 'UTF8ToString']"
+            "-sEXPORTED_FUNCTIONS=['_main', '_mountOpfs', '_startRunner', '_stopRunner', '_malloc', '_free', '_getKeyDownPtr', '_getKeyUpPtr', '_getKeyCount', '_setAudioSampleRate', '_pullAudioFrames']"
+            "-sOFFSCREENCANVAS_SUPPORT=1"
+            "-sOFFSCREEN_FRAMEBUFFER=1"
+            "-sMIN_WEBGL_VERSION=2"
+            "-sMAX_WEBGL_VERSION=2"
+            "-sFULL_ES3=1"
+            "-sALLOW_MEMORY_GROWTH"
+            "-sSHARED_MEMORY=1"
+            "-sPTHREAD_POOL_SIZE=4"
+            "--use-port=bzip2"
+            "-pthread"
+    )
+
+    target_compile_options(butterscotch PRIVATE "--use-port=bzip2" "-pthread")
+elseif(PLATFORM STREQUAL "web-meta")
+    set_target_properties(butterscotch PROPERTIES
+        SUFFIX ".mjs"
+        OUTPUT_NAME "butterscotch-meta"
+    )
+
+    target_link_options(
+            butterscotch
+            PRIVATE
+            "-sMODULARIZE=1"
+            "-sEXPORT_ES6=1"
+            "-sENVIRONMENT=web"
+            "-sEXPORTED_RUNTIME_METHODS=['HEAPU8', 'ccall', 'cwrap', 'UTF8ToString', 'FS']"
+            "-sEXPORTED_FUNCTIONS=['_main', '_parseDataWin', '_freeDataWin', '_getGameName', '_getGameDisplayName', '_getMajorVersion', '_getMinorVersion', '_getRelease', '_getBuild', '_getDefaultWindowWidth', '_getDefaultWindowHeight', '_malloc', '_free']"
+            "-sALLOW_MEMORY_GROWTH=1"
+            "-sFORCE_FILESYSTEM=1"
     )
 elseif(PLATFORM STREQUAL "ps2")
     # The PS2 EE has a single-precision FPU only, so double is software-emulated
@@ -320,6 +404,61 @@ elseif(PLATFORM STREQUAL "ps2")
                 ${CMAKE_SOURCE_DIR}/ps2dev-headers/gcc-include
         )
     endif()
+elseif(PLATFORM STREQUAL "ps3")
+    file(GLOB GL_SOURCES src/gl_legacy/*.c src/image/*.c vendor/ps3gl/*.c)
+    file(GLOB AL_SOURCES vendor/mojoal/mojoal.c)
+    target_sources(butterscotch PRIVATE ${GL_SOURCES} ${AL_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl_legacy)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/vendor/ps3gl)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/vendor/mojoal)
+
+    # Butterscotch VM/interpreter profiler
+    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
+    if(ENABLE_VM_GML_PROFILER)
+        add_compile_definitions(ENABLE_VM_GML_PROFILER)
+    endif()
+
+    # Butterscotch VM/interpreter tracing
+    option(ENABLE_VM_TRACING "Enable Butterscotch VM/interpreter tracing checks" OFF)
+    if(ENABLE_VM_TRACING)
+        add_compile_definitions(ENABLE_VM_TRACING)
+    endif()
+
+    # Butterscotch VM opcode count profiler
+    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" OFF)
+    if(ENABLE_VM_OPCODE_PROFILER)
+        add_compile_definitions(ENABLE_VM_OPCODE_PROFILER)
+    endif()
+
+    # Spatial grid logs
+    option(ENABLE_SPATIAL_GRID_LOGS "Enable Spatial Grid logs" OFF)
+    if(ENABLE_SPATIAL_GRID_LOGS)
+        add_compile_definitions(ENABLE_SPATIAL_GRID_LOGS)
+    endif()
+
+    # VM unknown/stubbed function logs
+    option(ENABLE_VM_STUB_LOGS "Enable VM unknown/stubbed function logs" OFF)
+    if(ENABLE_VM_STUB_LOGS)
+        add_compile_definitions(ENABLE_VM_STUB_LOGS)
+    endif()
+    
+    # stb_image
+    target_include_directories(butterscotch PUBLIC vendor/stb/image)
+
+    # stb_vorbis
+    target_include_directories(butterscotch PUBLIC vendor/stb/vorbis)
+
+    # Platform identifier for PS3-specific code paths
+    add_compile_definitions(PLATFORM_PS3)
+    add_compile_definitions(IS_BIG_ENDIAN)
+    add_compile_definitions(AL_LIBTYPE_STATIC)
+
+    set(CMAKE_EXE_LINKER_FLAGS "-mhard-float -fmodulo-sched -Wl,--gc-sections -L$ENV{PS3DEV}/ppu/lib -L$ENV{PS3DEV}/portlibs/ppu/lib")
+
+    find_package(SDL2 REQUIRED)
+    target_include_directories(butterscotch PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(butterscotch PRIVATE ${SDL2_LIBRARIES} m gcm_sys rsx sysutil io audio rt lv2 io audio bz2)
 else()
     message(FATAL_ERROR "Unknown platform! ${PLATFORM}")
 endif()
